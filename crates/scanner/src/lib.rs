@@ -8,7 +8,8 @@
 //! - A file with no chapters becomes a single episode.
 //! - The scan is **idempotent**. If an unchanged source is already fully
 //!   indexed, the scanner does not split it again. The `guid`s and `pubDate`s
-//!   stay stable.
+//!   stay stable. A folder cover that appears, changes, or disappears is
+//!   still applied on that path, without a re-split.
 //! - The scanner **skips DRM-protected input** (AAX/AAXC/`.aa`/`.odm`) and
 //!   returns a typed error. Podspine ships no circumvention (PRD W5).
 //!
@@ -23,6 +24,13 @@
 //!   filename order is the fallback. A folder of several `.m4b`/`.m4a` is
 //!   several books instead, unless its `.podspine.toml` sets
 //!   `folder_is_one_book`.
+//!
+//! A `cover.jpg`, `cover.jpeg`, `cover.png`, `folder.jpg`, `folder.jpeg`, or
+//! `folder.png` in the book's own folder is that book's cover. The first name
+//! in that list wins, and the match ignores case. That image takes precedence
+//! over artwork embedded in the audio. The scan copies it into the data
+//! directory (cover routes only serve files there) and builds the browse
+//! thumbnail from the copy.
 //!
 //! The scanner assigns collision-free slugs deterministically. One bad book
 //! never aborts the whole scan. The scanner stream-copies Tier-2 inputs
@@ -363,7 +371,7 @@ fn plan_book(
 
     // Idempotency check: if the book is already indexed at this mtime and all
     // files are present, the scan is done. Do not re-probe or re-split.
-    if let Some(existing) = index.get_book(&id)? {
+    if let Some(mut existing) = index.get_book(&id)? {
         previous_cover = existing.cover_path.clone();
         if existing.source_mtime == source_mtime {
             let eps = index.episodes_for_book(&id)?;
@@ -463,6 +471,16 @@ fn plan_book(
                 && transcode_consistent
                 && files_present
             {
+                // A folder image can appear, change, or disappear without the
+                // audio mtime moving. Apply that here so the book is not split
+                // again. Episode guids stay on `source_mtime`.
+                adopt_folder_cover(
+                    input.parent().unwrap_or(input),
+                    &book_out,
+                    &mut existing,
+                    index,
+                    Some(input),
+                );
                 // The book is up to date, but a browse-UI thumbnail can be missing:
                 // a library that predates thumbnails, or a thumbnail deleted from
                 // the cache. Backfill it from the already-extracted cover, without
@@ -877,55 +895,43 @@ fn ingest_single(
     };
     log_stage(id, "split", split_start);
 
-    // Extract the embedded cover, if any. A missing cover is a normal case. An
-    // extraction failure never fails the book; the server then serves no cover
-    // art. `cover` includes the browse-UI thumbnail regeneration below it.
+    // A folder image wins over an embedded cover. A missing cover is a normal
+    // case. A copy or extraction failure never fails the book; the server then
+    // serves no cover art, or keeps the previous file when extraction fails.
+    // `cover` includes the browse-UI thumbnail regeneration below it.
     let cover_start = std::time::Instant::now();
-    let cover_path = if probed.has_cover {
-        let ext = cover_ext(probed.cover_codec.as_deref());
-        match extract_cover(input, book_out, ext) {
-            Ok(path) => {
-                // Regenerate the browse-UI thumbnail from the freshly extracted
-                // cover, in this same thread and atomically, so that it always
-                // matches the cover. The http layer only ever *serves* the
-                // thumbnail. That split keeps thumbnail and cover consistent
-                // with no cross-thread race.
-                //
-                // Delete the previous thumbnail FIRST. If regeneration then
-                // fails, the book is left with NO thumbnail, not with a stale
-                // one derived from the old cover. (The serve layer falls back
-                // to the current full cover, and the next reconcile backfills
-                // the thumbnail.)
-                let _ = std::fs::remove_file(cover_thumb_path(book_out));
-                if let Err(err) = extract_cover_thumb(&path, book_out) {
-                    tracing::warn!(error = %err, id = %id, "cover thumbnail failed; browse UI will use the full cover");
-                }
-                Some(path.to_string_lossy().into_owned())
-            }
+    let cover_path = match input.parent().and_then(find_sidecar_cover) {
+        Some(sidecar) => match publish_sidecar_cover(&sidecar, book_out, id) {
+            Ok(path) => Some(path.to_string_lossy().into_owned()),
             Err(err) => {
-                // `extract_cover` publishes atomically: it writes a `.part`
-                // sibling and renames it only on success. A failed extraction
-                // therefore leaves the previous `cover.jpg`, and its thumbnail,
-                // intact on disk. Keep the stored path; do not drop it to
-                // `None` and orphan that still-valid art. `None` would 404 both
-                // cover routes and block the reconcile thumbnail backfill,
-                // which requires a populated `cover_path`. `plan_book` read
-                // this path from the row that is still current: nothing has
-                // been committed for this ingest yet.
-                let kept = single
-                    .previous_cover
-                    .clone()
-                    .filter(|p| Path::new(p).exists());
-                if kept.is_some() {
-                    tracing::warn!(error = %err, id = %id, "cover extraction failed; keeping the previously extracted cover");
-                } else {
-                    tracing::warn!(error = %err, id = %id, "cover extraction failed; serving no cover");
-                }
-                kept
+                tracing::warn!(
+                    error = %err,
+                    id = %id,
+                    path = %sidecar.display(),
+                    "folder cover copy failed; trying an embedded cover"
+                );
+                extract_embedded_cover(
+                    input,
+                    book_out,
+                    probed.has_cover,
+                    probed.cover_codec.as_deref(),
+                    single.previous_cover.as_deref(),
+                    id,
+                )
             }
+        },
+        None => {
+            // The published file is no longer a copy of a folder image.
+            let _ = std::fs::remove_file(book_out.join(COVER_SIDECAR_MARKER));
+            extract_embedded_cover(
+                input,
+                book_out,
+                probed.has_cover,
+                probed.cover_codec.as_deref(),
+                single.previous_cover.as_deref(),
+                id,
+            )
         }
-    } else {
-        None
     };
     log_stage(id, "cover", cover_start);
 
@@ -1255,6 +1261,8 @@ fn plan_track_folder(
                 .iter()
                 .all(|e| file_has_length(&e.file_path, e.byte_length))
         {
+            let mut existing = existing;
+            adopt_folder_cover(dir, &book_out, &mut existing, index, None);
             return Ok(BookPlan::UpToDate(Box::new(existing)));
         }
     }
@@ -1501,6 +1509,10 @@ fn ingest_track_folder(
     order_tracks(&mut tracks, dir);
     log_stage(id, "probe", probe_start);
 
+    let cover_start = std::time::Instant::now();
+    let cover_path = resolve_folder_cover(dir, &task.book_out, id);
+    log_stage(id, "cover", cover_start);
+
     let book = BookRow {
         id: id.to_string(),
         slug: id.to_string(),
@@ -1512,7 +1524,7 @@ fn ingest_track_folder(
         // `storage_mode` (`None` = follow the global setting).
         title: task.title.clone(),
         author: task.author.clone(),
-        cover_path: None,
+        cover_path,
         source_path: dir.to_string_lossy().into_owned(),
         source_mtime: task.source_mtime,
         storage_mode: None,
@@ -3138,6 +3150,420 @@ fn expected_transcode(input: &Path, mode: TranscodeMode) -> Option<TranscodeMode
     }
 }
 
+/// Folder images Podspine treats as a book's cover, in preference order.
+/// `cover.*` wins over `folder.*`. The match ignores ASCII case, so
+/// `Cover.JPG` counts. `.jpeg` is its own name, distinct from `.jpg`.
+const SIDECAR_COVER_NAMES: &[&str] = &[
+    "cover.jpg",
+    "cover.jpeg",
+    "cover.png",
+    "folder.jpg",
+    "folder.jpeg",
+    "folder.png",
+];
+
+/// Marks a published cover as a byte copy of a folder image. A later scan
+/// uses it to tell that copy from an extracted embedded cover, so deleting
+/// the folder image can fall back. The file is not an episode and is never
+/// served.
+const COVER_SIDECAR_MARKER: &str = "cover.sidecar";
+
+/// The first usable folder image in `dir`, or `None` when the folder has none.
+///
+/// Names are tried in [`SIDECAR_COVER_NAMES`] order. An exact-case match wins
+/// over another case of the same name. Empty files and directories are
+/// skipped, so a zero-byte `cover.jpg` does not hide a real `folder.png`.
+fn find_sidecar_cover(dir: &Path) -> Option<PathBuf> {
+    let entries = sidecar_cover_entries(dir);
+    for candidate in SIDECAR_COVER_NAMES {
+        if let Some((_, path)) = entries
+            .iter()
+            .find(|(name, path)| name == candidate && usable_cover_file(path))
+        {
+            return Some(path.clone());
+        }
+        if let Some((_, path)) = entries.iter().find(|(name, path)| {
+            name.eq_ignore_ascii_case(candidate) && usable_cover_file(path)
+        }) {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
+/// `(file name, path)` for every directory entry whose name is Unicode.
+fn sidecar_cover_entries(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|ent| {
+            let path = ent.path();
+            let name = path.file_name()?.to_str()?.to_owned();
+            Some((name, path))
+        })
+        .collect()
+}
+
+/// A non-empty regular file. Symlinks are followed; a directory or an empty
+/// placeholder is not a cover.
+fn usable_cover_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// Whether `a` and `b` are regular files of equal length and equal bytes.
+/// A missing file is not equal. The compare streams, so a short read cannot
+/// report two different files as the same.
+fn files_identical(a: &Path, b: &Path) -> bool {
+    let Ok(meta_a) = std::fs::metadata(a) else {
+        return false;
+    };
+    let Ok(meta_b) = std::fs::metadata(b) else {
+        return false;
+    };
+    if !meta_a.is_file() || !meta_b.is_file() || meta_a.len() != meta_b.len() {
+        return false;
+    }
+    let Ok(mut fa) = std::fs::File::open(a) else {
+        return false;
+    };
+    let Ok(mut fb) = std::fs::File::open(b) else {
+        return false;
+    };
+    let mut buf_a = [0u8; 8192];
+    let mut buf_b = [0u8; 8192];
+    loop {
+        let Ok(n) = read_full(&mut fa, &mut buf_a) else {
+            return false;
+        };
+        let Ok(m) = read_full(&mut fb, &mut buf_b) else {
+            return false;
+        };
+        if n == 0 && m == 0 {
+            return true;
+        }
+        if n != m || buf_a[..n] != buf_b[..m] {
+            return false;
+        }
+    }
+}
+
+/// Read until `buf` is full or `r` hits EOF. Returns the number of bytes read.
+fn read_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    let mut off = 0;
+    while off < buf.len() {
+        match r.read(&mut buf[off..])? {
+            0 => break,
+            n => off += n,
+        }
+    }
+    Ok(off)
+}
+
+/// Extension of a published folder cover. `.jpeg` stays `.jpeg` so the served
+/// file keeps the source's own suffix; anything else in the allow-list is
+/// `.jpg` or `.png`.
+fn sidecar_cover_ext(path: &Path) -> &'static str {
+    match ext_lower(path).as_deref() {
+        Some("png") => "png",
+        Some("jpeg") => "jpeg",
+        _ => "jpg",
+    }
+}
+
+/// Copy `src` onto `dest` by writing a sibling `*.part.*` and renaming it.
+/// A reader sees the previous file or the finished one.
+fn copy_cover_atomic(src: &Path, dest: &Path) -> Result<(), ScanError> {
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir).map_err(|source| ScanError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    }
+    let part = cover_part_path(dest);
+    let copied = std::fs::copy(src, &part).map_err(|source| ScanError::Io {
+        path: src.to_path_buf(),
+        source,
+    })?;
+    if copied == 0 {
+        let _ = std::fs::remove_file(&part);
+        return Err(ScanError::Io {
+            path: src.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, "cover image is empty"),
+        });
+    }
+    if let Err(source) = std::fs::rename(&part, dest) {
+        let _ = std::fs::remove_file(&part);
+        return Err(ScanError::Io {
+            path: dest.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
+}
+
+/// `cover.jpg` → `cover.part.jpg`, matching the splitter's part-file shape so
+/// episode sweeps (all-digit stems) leave it alone.
+fn cover_part_path(out_path: &Path) -> PathBuf {
+    let stem = out_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cover");
+    let name = match out_path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if !ext.is_empty() => format!("{stem}.part.{ext}"),
+        _ => format!("{stem}.part"),
+    };
+    out_path.with_file_name(name)
+}
+
+/// Drop published cover files other than `keep`. The thumbnail and the
+/// sidecar marker are left for the caller.
+fn remove_other_published_covers(book_out: &Path, keep: &Path) {
+    for name in ["cover.jpg", "cover.jpeg", "cover.png"] {
+        let path = book_out.join(name);
+        if path != keep {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Remove every published cover, its thumbnail, its part files, and the
+/// sidecar marker. Episode files in the same directory are left alone.
+fn clear_published_covers(book_out: &Path) {
+    for name in [
+        "cover.jpg",
+        "cover.jpeg",
+        "cover.png",
+        "cover.part.jpg",
+        "cover.part.jpeg",
+        "cover.part.png",
+        "cover_thumb.jpg",
+        COVER_SIDECAR_MARKER,
+    ] {
+        let _ = std::fs::remove_file(book_out.join(name));
+    }
+}
+
+/// Delete the previous thumbnail, then build a new one from `cover`. A failed
+/// thumbnail leaves the book with the full image, which the browse UI serves
+/// in its place.
+fn replace_cover_thumb(cover: &Path, book_out: &Path, id: &str) {
+    let _ = std::fs::remove_file(cover_thumb_path(book_out));
+    if let Err(err) = extract_cover_thumb(cover, book_out) {
+        tracing::warn!(error = %err, id = %id, "cover thumbnail failed; browse UI will use the full cover");
+    }
+}
+
+/// Copy a folder image into `book_out/cover.<ext>`, record that the published
+/// file came from the folder, and rebuild the thumbnail.
+fn publish_sidecar_cover(src: &Path, book_out: &Path, id: &str) -> Result<PathBuf, ScanError> {
+    let dest = book_out.join(format!("cover.{}", sidecar_cover_ext(src)));
+    copy_cover_atomic(src, &dest)?;
+    remove_other_published_covers(book_out, &dest);
+    replace_cover_thumb(&dest, book_out, id);
+    if let Err(err) = std::fs::write(book_out.join(COVER_SIDECAR_MARKER), b"1") {
+        tracing::warn!(error = %err, id = %id, "could not record that the cover came from the folder");
+    }
+    tracing::info!(id = %id, path = %src.display(), "using folder cover");
+    Ok(dest)
+}
+
+/// Extract the embedded cover, if `has_cover`. A missing cover returns
+/// `None`. A failed extraction keeps `previous` when that file is still on
+/// disk, so a rescan does not orphan art the server is already serving.
+fn extract_embedded_cover(
+    audio: &Path,
+    book_out: &Path,
+    has_cover: bool,
+    codec: Option<&str>,
+    previous: Option<&str>,
+    id: &str,
+) -> Option<String> {
+    if !has_cover {
+        return None;
+    }
+    let ext = cover_ext(codec);
+    match extract_cover(audio, book_out, ext) {
+        Ok(path) => {
+            // This file is an embedded extract, not a folder copy.
+            let _ = std::fs::remove_file(book_out.join(COVER_SIDECAR_MARKER));
+            remove_other_published_covers(book_out, &path);
+            // Regenerate the browse-UI thumbnail from the freshly extracted
+            // cover, in this same thread and atomically, so that it always
+            // matches the cover. The http layer only ever *serves* the
+            // thumbnail. That split keeps thumbnail and cover consistent
+            // with no cross-thread race.
+            //
+            // Delete the previous thumbnail FIRST. If regeneration then
+            // fails, the book is left with NO thumbnail, not with a stale
+            // one derived from the old cover. (The serve layer falls back
+            // to the current full cover, and the next reconcile backfills
+            // the thumbnail.)
+            replace_cover_thumb(&path, book_out, id);
+            Some(path.to_string_lossy().into_owned())
+        }
+        Err(err) => {
+            // `extract_cover` publishes atomically: it writes a `.part`
+            // sibling and renames it only on success. A failed extraction
+            // therefore leaves the previous `cover.jpg`, and its thumbnail,
+            // intact on disk. Keep the stored path; do not drop it to
+            // `None` and orphan that still-valid art. `None` would 404 both
+            // cover routes and block the reconcile thumbnail backfill,
+            // which requires a populated `cover_path`. `plan_book` read
+            // this path from the row that is still current: nothing has
+            // been committed for this ingest yet.
+            let kept = previous
+                .filter(|p| Path::new(p).exists())
+                .map(str::to_string);
+            if kept.is_some() {
+                tracing::warn!(error = %err, id = %id, "cover extraction failed; keeping the previously extracted cover");
+            } else {
+                tracing::warn!(error = %err, id = %id, "cover extraction failed; serving no cover");
+            }
+            kept
+        }
+    }
+}
+
+/// Cover for a track folder: the folder image, copied into the data dir.
+/// With no folder image, a cover copied on an earlier ingest is removed.
+/// Track folders have no embedded-cover extract.
+fn resolve_folder_cover(book_dir: &Path, book_out: &Path, id: &str) -> Option<String> {
+    match find_sidecar_cover(book_dir) {
+        Some(sidecar) => match publish_sidecar_cover(&sidecar, book_out, id) {
+            Ok(path) => Some(path.to_string_lossy().into_owned()),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    id = %id,
+                    path = %sidecar.display(),
+                    "folder cover copy failed; serving no cover"
+                );
+                None
+            }
+        },
+        None => {
+            if book_out.join(COVER_SIDECAR_MARKER).is_file() {
+                clear_published_covers(book_out);
+            }
+            None
+        }
+    }
+}
+
+/// Apply a folder-cover change to a book that is otherwise up to date.
+///
+/// The audio mtime did not move, so this must not re-split and must not
+/// change episode guids. A published copy is detected by comparing bytes
+/// with the folder image. [`COVER_SIDECAR_MARKER`] says the published file
+/// came from the folder; when the image is gone, a single-file book falls
+/// back to its embedded cover and a track folder drops the image.
+fn adopt_folder_cover(
+    book_dir: &Path,
+    book_out: &Path,
+    book: &mut BookRow,
+    index: &Index,
+    embedded_audio: Option<&Path>,
+) {
+    let id = book.id.as_str();
+    match find_sidecar_cover(book_dir) {
+        Some(src) => {
+            let current = book.cover_path.as_deref().map(Path::new);
+            if current.is_some_and(|path| files_identical(&src, path)) {
+                let marker = book_out.join(COVER_SIDECAR_MARKER);
+                if !marker.is_file()
+                    && let Err(err) = std::fs::write(&marker, b"1")
+                {
+                    tracing::warn!(error = %err, id = %id, "could not record that the cover came from the folder");
+                }
+                // Track folders have no other thumbnail backfill. A single-file
+                // book also backfills below; doing it here makes either shape
+                // grow a thumbnail without a re-split.
+                if let Some(path) = current
+                    && !cover_thumb_path(book_out).exists()
+                    && let Err(err) = extract_cover_thumb(path, book_out)
+                {
+                    tracing::warn!(error = %err, id = %id, "cover thumbnail backfill failed; browse UI will use the full cover");
+                }
+                return;
+            }
+            match publish_sidecar_cover(&src, book_out, id) {
+                Ok(path) => store_cover_path(
+                    book,
+                    index,
+                    Some(path.to_string_lossy().into_owned()),
+                ),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    id = %id,
+                    path = %src.display(),
+                    "folder cover copy failed; keeping the current cover"
+                ),
+            }
+        }
+        None => {
+            let marker = book_out.join(COVER_SIDECAR_MARKER);
+            if !marker.is_file() {
+                return;
+            }
+            if let Some(audio) = embedded_audio {
+                match probe(audio) {
+                    Ok(probed) if probed.has_cover => {
+                        match extract_cover(
+                            audio,
+                            book_out,
+                            cover_ext(probed.cover_codec.as_deref()),
+                        ) {
+                            Ok(path) => {
+                                let _ = std::fs::remove_file(&marker);
+                                remove_other_published_covers(book_out, &path);
+                                replace_cover_thumb(&path, book_out, id);
+                                store_cover_path(
+                                    book,
+                                    index,
+                                    Some(path.to_string_lossy().into_owned()),
+                                );
+                            }
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                id = %id,
+                                "embedded cover extraction failed after the folder cover was removed; keeping the previous cover"
+                            ),
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            id = %id,
+                            "could not probe for an embedded cover after the folder cover was removed; keeping the previous cover"
+                        );
+                        return;
+                    }
+                }
+            }
+            clear_published_covers(book_out);
+            store_cover_path(book, index, None);
+        }
+    }
+}
+
+/// Persist `cover_path` when it changed. A failed write puts the in-memory
+/// row back, so the caller keeps serving the path the index still holds.
+fn store_cover_path(book: &mut BookRow, index: &Index, cover_path: Option<String>) {
+    if book.cover_path == cover_path {
+        return;
+    }
+    let previous = book.cover_path.clone();
+    book.cover_path = cover_path;
+    if let Err(err) = index.upsert_book(book) {
+        tracing::warn!(error = %err, id = %book.id, "could not store the updated cover");
+        book.cover_path = previous;
+    }
+}
+
 /// File extension for an extracted cover, from its ffprobe codec name. Cover art
 /// is almost always MJPEG or PNG; anything else defaults to `jpg`.
 fn cover_ext(codec: Option<&str>) -> &'static str {
@@ -3209,7 +3635,8 @@ fn mtime_epoch(p: &Path) -> Result<i64, ScanError> {
 mod tests {
     use super::*;
     use podspine_test_support::{
-        ScratchDir, skip, skip_unless_ffmpeg, synth_sine, synth_three_chapters, synth_with_cover,
+        ScratchDir, skip, skip_unless_ffmpeg, synth_cover_png, synth_sine, synth_three_chapters,
+        synth_with_cover,
     };
     use std::process::Command;
 
@@ -4702,6 +5129,161 @@ mod tests {
         assert_eq!(cover_ext(Some("jpeg")), "jpg");
         assert_eq!(cover_ext(Some("png")), "png");
         assert_eq!(cover_ext(None), "jpg");
+    }
+
+    #[test]
+    fn folder_cover_names_follow_preference_order_and_ignore_case() {
+        let dir = scratch("cover-names");
+        // A directory, an empty file, and an unsupported name are not covers.
+        std::fs::create_dir(dir.join("cover.jpg")).unwrap();
+        std::fs::write(dir.join("cover.jpeg"), b"").unwrap();
+        std::fs::write(dir.join("cover.webp"), b"webp").unwrap();
+        assert!(find_sidecar_cover(&dir).is_none(), "nothing usable yet");
+
+        std::fs::write(dir.join("folder.png"), b"folder-png").unwrap();
+        std::fs::write(dir.join("Folder.JPEG"), b"folder-jpeg").unwrap();
+        let found = find_sidecar_cover(&dir).unwrap();
+        assert_eq!(found.file_name().unwrap(), "Folder.JPEG");
+        assert_eq!(sidecar_cover_ext(&found), "jpeg");
+
+        // `cover.*` beats `folder.*`, and `.jpg` beats the later names.
+        std::fs::remove_dir(dir.join("cover.jpg")).unwrap();
+        std::fs::write(dir.join("cover.jpg"), b"cover-jpg").unwrap();
+        let found = find_sidecar_cover(&dir).unwrap();
+        assert_eq!(std::fs::read(&found).unwrap(), b"cover-jpg");
+        assert_eq!(sidecar_cover_ext(&found), "jpg");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_identical_compares_bytes_past_one_chunk() {
+        let dir = scratch("cover-identical");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        let mut bytes = vec![7u8; 9000];
+        bytes[8999] = 1;
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+        assert!(files_identical(&a, &b));
+        bytes[8999] = 2;
+        std::fs::write(&b, &bytes).unwrap();
+        assert!(!files_identical(&a, &b));
+        assert!(!files_identical(&a, &dir.join("missing")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_image_is_the_cover_and_a_later_edit_does_not_resplit() {
+        skip_unless_ffmpeg!();
+        let dir = scratch("cover-sidecar");
+        let audio = synth_sine(&dir, "book.m4a", 2.0);
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        let book = scan_book(&audio, &data, &index).unwrap();
+        assert!(book.cover_path.is_none(), "no folder image and no embedded art");
+        let guids = episode_guids(&index, &book.id);
+        let feed_id = book.feed_id.clone();
+
+        let png = synth_cover_png(&dir, 64);
+        let png_bytes = std::fs::read(&png).unwrap();
+        let book = scan_book(&audio, &data, &index).unwrap();
+        let cover = PathBuf::from(book.cover_path.expect("folder cover copied"));
+        assert!(cover.ends_with("cover.png"), "got {}", cover.display());
+        assert!(cover.starts_with(&data), "covers are served from the data dir");
+        assert_eq!(std::fs::read(&cover).unwrap(), png_bytes);
+        assert!(cover_thumb_path(cover.parent().unwrap()).exists());
+        assert!(cover.parent().unwrap().join(COVER_SIDECAR_MARKER).is_file());
+        assert!(!cover.parent().unwrap().join("cover.part.png").exists());
+        assert_eq!(episode_guids(&index, &book.id), guids);
+        assert_eq!(book.feed_id, feed_id);
+
+        // Replacing the image updates the published bytes and leaves the
+        // episode identities alone.
+        let png = synth_cover_png(&dir, 80);
+        let png_bytes = std::fs::read(&png).unwrap();
+        let book = scan_book(&audio, &data, &index).unwrap();
+        let cover = PathBuf::from(book.cover_path.expect("replaced cover"));
+        assert_eq!(std::fs::read(&cover).unwrap(), png_bytes);
+        assert_eq!(episode_guids(&index, &book.id), guids);
+        assert_eq!(book.feed_id, feed_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_image_beats_embedded_art_and_removal_falls_back() {
+        skip_unless_ffmpeg!();
+        let dir = scratch("cover-precedence");
+        let audio = synth_with_cover(&dir);
+        let png = synth_cover_png(&dir, 48);
+        let png_bytes = std::fs::read(&png).unwrap();
+        let data = dir.join("data");
+        let index = Index::open_in_memory().unwrap();
+
+        let book = scan_book(&audio, &data, &index).unwrap();
+        let cover = PathBuf::from(book.cover_path.expect("folder cover wins"));
+        assert!(cover.ends_with("cover.png"), "got {}", cover.display());
+        assert_eq!(std::fs::read(&cover).unwrap(), png_bytes);
+        let guids = episode_guids(&index, &book.id);
+        let feed_id = book.feed_id.clone();
+
+        std::fs::remove_file(&png).unwrap();
+        let book = scan_book(&audio, &data, &index).unwrap();
+        let cover = PathBuf::from(book.cover_path.expect("embedded cover"));
+        assert!(cover.ends_with("cover.jpg"), "got {}", cover.display());
+        assert_ne!(std::fs::read(&cover).unwrap(), png_bytes);
+        assert!(!cover.parent().unwrap().join(COVER_SIDECAR_MARKER).exists());
+        assert!(!cover.parent().unwrap().join("cover.png").exists());
+        assert_eq!(episode_guids(&index, &book.id), guids);
+        assert_eq!(book.feed_id, feed_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_track_folder_uses_folder_png_and_drops_it_when_removed() {
+        skip_unless_ffmpeg!();
+        let root = scratch("cover-folder");
+        let book_dir = root.join("Folder Book");
+        if synth_mp3(&book_dir, "01.mp3", Some(1), 2).is_none()
+            || synth_mp3(&book_dir, "02.mp3", Some(2), 2).is_none()
+        {
+            skip!("ffmpeg has no libmp3lame encoder");
+        }
+        let png = synth_cover_png(&book_dir, 40);
+        let png_bytes = std::fs::read(&png).unwrap();
+        std::fs::rename(&png, book_dir.join("folder.png")).unwrap();
+
+        let data = root.join("data");
+        let index = Index::open_in_memory().unwrap();
+        let summary = scan_library(&root, &data, &index, ScanOptions::default());
+        assert_eq!(summary.indexed, 1);
+
+        let books = index.list_books().unwrap();
+        assert_eq!(books.len(), 1);
+        let cover = PathBuf::from(books[0].cover_path.clone().expect("folder.png copied"));
+        assert!(cover.ends_with("cover.png"), "got {}", cover.display());
+        assert_eq!(std::fs::read(&cover).unwrap(), png_bytes);
+        let guids = episode_guids(&index, &books[0].id);
+
+        std::fs::remove_file(book_dir.join("folder.png")).unwrap();
+        scan_library(&root, &data, &index, ScanOptions::default());
+        let books = index.list_books().unwrap();
+        assert!(books[0].cover_path.is_none(), "removed folder image clears the cover");
+        assert_eq!(episode_guids(&index, &books[0].id), guids);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn episode_guids(index: &Index, id: &str) -> Vec<String> {
+        index
+            .episodes_for_book(id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.guid)
+            .collect()
     }
 
     #[test]

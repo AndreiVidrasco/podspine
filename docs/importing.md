@@ -97,8 +97,16 @@ playback order is correct.
   `--force-embedded-chapters`.
 
 ### The cover art is missing
-- Books with no embedded cover show a lettered placeholder in the UI and no
-  `itunes:image` unless you set `--default-cover-url`.
+- Put `cover.jpg`, `cover.jpeg`, `cover.png`, `folder.jpg`, `folder.jpeg`, or
+  `folder.png` in the book's folder (the same folder as the audio file, or the
+  track folder itself). Podspine uses the first of those it finds, and that
+  image takes precedence over artwork embedded in the file. The match ignores
+  case.
+- With no folder image and no embedded artwork, the UI shows a lettered
+  placeholder and the feed has no `itunes:image` unless you set
+  `--default-cover-url`.
+- Adding, replacing, or removing the folder image is picked up on the next
+  scan. The book is not re-split, and episode addresses stay the same.
 
 ## See also
 

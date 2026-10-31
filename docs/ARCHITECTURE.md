@@ -61,7 +61,7 @@ flowchart TD
   D -- no --> F[embedded chapters, or single episode]
   E --> G[splitter: stream-copy each chapter]
   F --> G
-  G --> H[extract cover, if any]
+  G --> H[folder image, else embedded cover]
   H --> I[(index: book + episodes)]
 ```
 
@@ -127,7 +127,7 @@ details.
         ├── 001.m4a          # per-chapter episode files (NNN.<ext>)
         ├── 002.m4a
         ├── ...
-        └── cover.jpg        # extracted cover, if present
+        └── cover.jpg        # folder image or extracted cover, if present
 ```
 
 Everything the HTTP layer serves lives under one of two trusted roots — `<data_dir>`
